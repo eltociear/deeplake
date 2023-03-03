@@ -1,4 +1,9 @@
 name: Test
+
+permissions:
+  id-token: write
+  contents: read
+
 on:
   push:
     branches:
@@ -23,8 +28,8 @@ jobs:
     secrets:
       token: ${{ secrets.GITHUB_TOKEN }}
       aws_role_arn: ${{ secrets.AWS_ROLE_ARN }}
-      gcp_service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-      gcp_workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      gcp_project_id: ${{ secrets.GCP_PROJECT_ID }}
+      gcp_sa_key: ${{ secrets.GCP_SA_KEY }}
       hub_username: ${{ secrets.ACTIVELOOP_HUB_USERNAME }}
       hub_password: ${{ secrets.ACTIVELOOP_HUB_PASSWORD }}
       kaggle_username: ${{ secrets.KAGGLE_USERNAME }}
