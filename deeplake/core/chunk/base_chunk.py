@@ -14,6 +14,7 @@ from deeplake.compression import (
 from deeplake.constants import CONVERT_GRAYSCALE
 from deeplake.core.fast_forwarding import ffw_chunk
 from deeplake.core.linked_sample import LinkedSample
+from deeplake.core.linked_tiled_sample import LinkedTiledSample
 from deeplake.core.meta.encode.byte_positions import BytePositionsEncoder
 from deeplake.core.meta.encode.shape import ShapeEncoder
 from deeplake.core.meta.tensor_meta import TensorMeta
@@ -25,6 +26,7 @@ from deeplake.core.serialize import (
     infer_chunk_num_bytes,
     infer_header_num_bytes,
     serialize_chunk,
+    serialize_linked_tiled_sample,
     serialize_numpy_and_base_types,
     serialize_sample_object,
     serialize_text,
@@ -36,9 +38,13 @@ from deeplake.core.serialize import (
 )
 from deeplake.core.storage.deeplake_memory_object import DeepLakeMemoryObject
 from deeplake.core.tiling.sample_tiles import SampleTiles
-from deeplake.util.exceptions import TensorInvalidSampleShapeError, EmptyTensorError
+from deeplake.util.exceptions import (
+    ReadSampleFromChunkError,
+    TensorInvalidSampleShapeError,
+    EmptyTensorError,
+)
 from deeplake.core.polygon import Polygons
-from functools import reduce
+from functools import reduce, wraps
 from operator import mul
 
 InputSample = Union[
@@ -306,6 +312,12 @@ class BaseChunk(DeepLakeMemoryObject):
                     "deeplake.link() samples can only be appended to linked tensors. To create linked tensors, include link in htype during create_tensor, for example 'link[image]'."
                 )
 
+        if isinstance(incoming_sample, LinkedTiledSample):
+            if not self.tensor_meta.is_link:
+                raise ValueError(
+                    "deeplake.link_tiled() samples can only be appended to linked tensors. To create linked tensors, include link in htype during create_tensor, for example 'link[image]'."
+                )
+
         if self.is_text_like:
             if isinstance(incoming_sample, LinkedSample):
                 incoming_sample = incoming_sample.path
@@ -324,6 +336,8 @@ class BaseChunk(DeepLakeMemoryObject):
                     raise TypeError(
                         f"Cannot append to {htype} tensor with Sample object"
                     )
+            elif isinstance(incoming_sample, LinkedTiledSample):
+                incoming_sample, shape = serialize_linked_tiled_sample(incoming_sample)
             else:
                 incoming_sample, shape = serialize_text(
                     incoming_sample, sample_compression, dt, ht  # type: ignore
@@ -394,12 +408,13 @@ class BaseChunk(DeepLakeMemoryObject):
 
     def convert_to_rgb(self, shape):
         if shape is not None and self.is_convert_candidate and CONVERT_GRAYSCALE:
+            ndim = len(shape)
             if self.num_dims is None:
-                self.num_dims = len(shape)
-            if len(shape) == 2 and self.num_dims == 3:
+                self.num_dims = max(3, ndim)
+            if ndim < self.num_dims:
                 message = "Grayscale images will be reshaped from (H, W) to (H, W, 1) to match tensor dimensions. This warning will be shown only once."
                 warnings.warn(message)
-                shape += (1,)  # type: ignore[assignment]
+                shape += (1,) * (self.num_dims - ndim)  # type: ignore[assignment]
         return shape
 
     def can_fit_sample(self, sample_nbytes, buffer_nbytes=0):
@@ -603,3 +618,16 @@ class BaseChunk(DeepLakeMemoryObject):
                 "This tensor has only been populated with empty samples. "
                 "Need to add at least one non-empty sample before retrieving data."
             )
+
+
+def catch_chunk_read_error(fn):
+    @wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        except EmptyTensorError:
+            raise
+        except Exception as e:
+            raise ReadSampleFromChunkError(self.key) from e
+
+    return wrapper

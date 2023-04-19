@@ -1,4 +1,6 @@
 from typing import Callable
+import warnings
+from deeplake.core.compression import to_image
 from deeplake.core.index import Index
 from deeplake.constants import _NO_LINK_UPDATE
 import inspect
@@ -7,8 +9,8 @@ import inspect
 import numpy as np
 from os import urandom
 from PIL import Image  # type: ignore
-from deeplake.util.downsample import downsample_sample
 from deeplake.core.linked_sample import read_linked_sample
+from deeplake.compression import IMAGE_COMPRESSION, get_compression_type
 import tqdm  # type: ignore
 
 optional_kwargs = {
@@ -101,6 +103,8 @@ def update_info(
 
 @link
 def update_shape(new_sample, link_creds=None, tensor_meta=None):
+    if new_sample is None:
+        return np.zeros(1, dtype=np.int64)
     if isinstance(new_sample, deeplake.core.linked_sample.LinkedSample):
         new_sample = read_linked_sample(
             new_sample.path, new_sample.creds_key, link_creds, verify=False
@@ -112,8 +116,29 @@ def update_shape(new_sample, link_creds=None, tensor_meta=None):
             getattr(new_sample, "shape", None) or np.array(new_sample).shape,
             dtype=np.int64,
         )
-    if tensor_meta and tensor_meta.is_link and ret.size and np.prod(ret):
-        tensor_meta.update_shape_interval(ret.tolist())
+
+    if tensor_meta:
+        # if grayscale being appended but tensor has rgb samples, convert shape from (h, w) to (h, w, 1)
+        if (
+            tensor_meta.min_shape
+            and (
+                tensor_meta.htype == "image"
+                or (
+                    IMAGE_COMPRESSION
+                    in map(
+                        get_compression_type,
+                        (tensor_meta.sample_compression, tensor_meta.chunk_compression),
+                    )
+                )
+            )
+            and ret.shape == (2,)
+            and len(tensor_meta.min_shape) == 3
+        ):
+            ret = np.concatenate([ret, (1,)])
+
+        if tensor_meta.is_link and ret.size and np.prod(ret):
+            tensor_meta.update_shape_interval(ret.tolist())
+
     return ret
 
 
@@ -121,29 +146,28 @@ def update_shape(new_sample, link_creds=None, tensor_meta=None):
 def extend_shape(samples, link_creds=None, tensor_meta=None):
     if isinstance(samples, np.ndarray):
         if samples.dtype != object:
-            return np.tile(np.array([samples.shape[1:]]), (len(samples), 1))
+            samples_shape = samples.shape
+            if samples.ndim == 1:
+                samples_shape = samples_shape + (1,)
+            return np.tile(np.array([samples_shape[1:]]), (samples_shape[0], 1))
     if samples is None:
         return np.array([], dtype=np.int64)
     shapes = [
         update_shape.f(sample, link_creds=link_creds, tensor_meta=tensor_meta)
         for sample in samples
     ]
-    mixed_ndim = False
-    try:
-        arr = np.array(shapes)
-        if arr.dtype == object:
-            mixed_ndim = True
-    except ValueError:
-        mixed_ndim = True
+
+    max_ndim = max(map(len, shapes), default=0)
+    min_ndim = min(map(len, shapes), default=0)
+    mixed_ndim = max_ndim != min_ndim
 
     if mixed_ndim:
-        ndim = max(map(len, shapes))
         for i, s in enumerate(shapes):
-            if len(s) < ndim:
+            if len(s) < max_ndim:
                 shapes[i] = np.concatenate(
-                    [s, (int(bool(np.prod(s))),) * (ndim - len(s))]
+                    [s, (int(bool(np.any(s) and np.prod(s))),) * (max_ndim - len(s))]
                 )
-        arr = np.array(shapes)
+    arr = np.array(shapes)
     return arr
 
 
@@ -158,16 +182,23 @@ def update_len(new_sample, link_creds=None):
 
 
 def convert_sample_for_downsampling(sample, link_creds=None):
-    if isinstance(sample, deeplake.core.linked_sample.LinkedSample):
-        sample = read_linked_sample(
-            sample.path, sample.creds_key, link_creds, verify=False
-        )
-    if isinstance(sample, deeplake.core.sample.Sample):
-        sample = sample.pil
-    if isinstance(sample, np.ndarray):
-        sample = Image.fromarray(sample)
-    # PartialSample isn't converted
-    return sample
+    try:
+        if isinstance(sample, deeplake.core.linked_sample.LinkedSample):
+            sample = read_linked_sample(
+                sample.path, sample.creds_key, link_creds, verify=False
+            )
+        if isinstance(sample, deeplake.core.sample.Sample):
+            sample = sample.pil
+        if (
+            isinstance(sample, np.ndarray)
+            and sample.dtype != bool
+            and 0 not in sample.shape
+        ):
+            sample = to_image(sample)
+        return sample
+    except Exception as e:
+        warnings.warn(f"Failed to downsample sample of type {type(sample)}")
+        return None
 
 
 @link
@@ -175,7 +206,12 @@ def extend_downsample(samples, factor, compression, htype, link_creds=None):
     samples = [
         convert_sample_for_downsampling(sample, link_creds) for sample in samples
     ]
-    return [downsample_sample(sample, factor, compression, htype) for sample in samples]
+    return [
+        deeplake.util.downsample.downsample_sample(
+            sample, factor, compression, htype, False, link_creds
+        )
+        for sample in samples
+    ]
 
 
 @link
@@ -193,7 +229,9 @@ def update_downsample(
         for index_entry in sub_index.values:
             if not isinstance(index_entry.value, slice):
                 return _NO_LINK_UPDATE
-    downsampled = downsample_sample(new_sample, factor, compression, htype, partial)
+    downsampled = deeplake.util.downsample.downsample_sample(
+        new_sample, factor, compression, htype, partial, link_creds
+    )
     if partial:
         downsampled_sub_index = sub_index.downsample(factor, downsampled.shape)
         return downsampled_sub_index, downsampled

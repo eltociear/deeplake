@@ -1,5 +1,6 @@
 import pytest
 import deeplake
+from deeplake.constants import HUB_CLOUD_DEV_USERNAME
 
 
 enabled_datasets = pytest.mark.parametrize(
@@ -31,6 +32,16 @@ enabled_persistent_dataset_generators = pytest.mark.parametrize(
         "s3_ds_generator",
         "gcs_ds_generator",
         "gdrive_ds_generator",
+    ],
+    indirect=True,
+)
+
+enabled_persistent_non_gdrive_dataset_generators = pytest.mark.parametrize(
+    "ds_generator",
+    [
+        "local_ds_generator",
+        "s3_ds_generator",
+        "gcs_ds_generator",
     ],
     indirect=True,
 )
@@ -113,6 +124,25 @@ def hub_cloud_ds_generator(hub_cloud_path, hub_cloud_dev_token):
         return deeplake.dataset(hub_cloud_path, token=hub_cloud_dev_token, **kwargs)
 
     return generate_hub_cloud_ds
+
+
+@pytest.fixture
+def hub_cloud_gcs_ds_generator(gcs_path, gcs_creds, hub_cloud_dev_token):
+    def generate_hub_cloud_gcs_ds(**kwargs):
+        ds = deeplake.dataset(gcs_path, creds=gcs_creds, **kwargs)
+        ds.connect(
+            org_id=HUB_CLOUD_DEV_USERNAME,
+            token=hub_cloud_dev_token,
+            creds_key="DEEPLAKE_GCP",
+        )
+        return ds
+
+    return generate_hub_cloud_gcs_ds
+
+
+@pytest.fixture
+def hub_cloud_gcs_ds(hub_cloud_gcs_ds_generator):
+    return hub_cloud_gcs_ds_generator()
 
 
 @pytest.fixture

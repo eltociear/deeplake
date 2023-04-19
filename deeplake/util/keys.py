@@ -10,11 +10,13 @@ from deeplake.constants import (
     ENCODED_CHUNK_NAMES_FOLDER,
     ENCODED_SEQUENCE_NAMES_FOLDER,
     ENCODED_TILE_NAMES_FOLDER,
+    ENCODED_PAD_NAMES_FOLDER,
     FIRST_COMMIT_ID,
     DATASET_META_FILENAME,
     TENSOR_INFO_FILENAME,
     TENSOR_META_FILENAME,
-    TENSOR_COMMIT_CHUNK_SET_FILENAME,
+    TENSOR_COMMIT_CHUNK_MAP_FILENAME,
+    TENSOR_COMMIT_CHUNK_MAP_FILENAME,
     TENSOR_COMMIT_DIFF_FILENAME,
     VERSION_CONTROL_INFO_FILENAME,
     VERSION_CONTROL_INFO_FILENAME_OLD,
@@ -22,7 +24,6 @@ from deeplake.constants import (
     QUERIES_FILENAME,
     QUERIES_LOCK_FILENAME,
 )
-from deeplake.util.downsample import get_downsample_factor
 from deeplake.util.exceptions import (
     S3GetError,
     S3GetAccessError,
@@ -122,10 +123,10 @@ def get_tensor_info_key(key: str, commit_id: str) -> str:
     return "/".join(("versions", commit_id, key, TENSOR_INFO_FILENAME))
 
 
-def get_tensor_commit_chunk_set_key(key: str, commit_id: str) -> str:
+def get_tensor_commit_chunk_map_key(key: str, commit_id: str) -> str:
     if commit_id == FIRST_COMMIT_ID:
-        return "/".join((key, TENSOR_COMMIT_CHUNK_SET_FILENAME))
-    return "/".join(("versions", commit_id, key, TENSOR_COMMIT_CHUNK_SET_FILENAME))
+        return "/".join((key, TENSOR_COMMIT_CHUNK_MAP_FILENAME))
+    return "/".join(("versions", commit_id, key, TENSOR_COMMIT_CHUNK_MAP_FILENAME))
 
 
 def get_tensor_commit_diff_key(key: str, commit_id: str) -> str:
@@ -229,9 +230,25 @@ def get_sample_shape_tensor_key(key: str):
 def get_downsampled_tensor_key(key: str, factor: int):
     group, key = posixpath.split(key)
     if key.startswith("_") and "downsampled" in key:
-        current_factor = get_downsample_factor(key)
+        current_factor = int(key.split("_")[-1])
         factor *= current_factor
         ls = key.split("_")
         ls[-1] = str(factor)
-        return "_".join(ls)
-    return posixpath.join(group, f"_{key}_downsampled_{factor}")
+        final_key = "_".join(ls)
+    else:
+        final_key = f"_{key}_downsampled_{factor}"
+    return posixpath.join(group, final_key)
+
+
+def get_pad_encoder_key(key: str, commit_id: str) -> str:
+    if commit_id == FIRST_COMMIT_ID:
+        return "/".join((key, ENCODED_PAD_NAMES_FOLDER, UNSHARDED_ENCODER_FILENAME))
+    return "/".join(
+        (
+            "versions",
+            commit_id,
+            key,
+            ENCODED_PAD_NAMES_FOLDER,
+            UNSHARDED_ENCODER_FILENAME,
+        )
+    )

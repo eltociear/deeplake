@@ -5,8 +5,12 @@ import deeplake
 import uuid
 import time
 import warnings
-from deeplake.tests.dataset_fixtures import enabled_cloud_dataset_generators
-
+import json
+from deeplake.tests.dataset_fixtures import (
+    enabled_persistent_non_gdrive_dataset_generators,
+)
+from concurrent.futures import ThreadPoolExecutor
+import deeplake
 
 _counter = 0
 
@@ -23,7 +27,7 @@ class VM(object):
 
     def __enter__(self):
         self._getnode = uuid.getnode
-        uuid.getnode = lambda: self.id
+        uuid.getnode = lambda: self.id  # type: ignore
         self._locks = deeplake.core.lock._LOCKS.copy()
         deeplake.core.lock._LOCKS.clear()
 
@@ -32,57 +36,52 @@ class VM(object):
         deeplake.core.lock._LOCKS.update(self._locks)
 
 
-@enabled_cloud_dataset_generators
+@enabled_persistent_non_gdrive_dataset_generators
 def test_dataset_locking(ds_generator):
-    ds = ds_generator()
-    ds.create_tensor("x")
-    arr = np.random.random((32, 32))
-    ds.x.append(arr)
+    deeplake.constants.LOCK_LOCAL_DATASETS = True
+    try:
+        ds = ds_generator()
+        ds.create_tensor("x")
+        arr = np.random.random((32, 32))
+        ds.x.append(arr)
 
-    with VM():
-        # Make sure read only warning is raised
-        with pytest.warns(UserWarning):
-            ds = ds_generator()
-            np.testing.assert_array_equal(arr, ds.x[0].numpy())
-        assert ds.read_only == True
-        with pytest.raises(LockedException):
-            ds.read_only = False
-        # Raise error if user explicitly asks for write access
-        with pytest.raises(LockedException):
-            ds = ds_generator(read_only=False)
-        # No warnings if user requests read only mode
-        with warnings.catch_warnings(record=True) as ws:
-            ds = ds_generator(read_only=True)
-            np.testing.assert_array_equal(arr, ds.x[0].numpy())
-        assert not ws
-
-        DATASET_LOCK_VALIDITY = deeplake.constants.DATASET_LOCK_VALIDITY
-        # Temporarily set validity to 1 second so we dont have to wait too long.
-        deeplake.constants.DATASET_LOCK_VALIDITY = 1
-        # Wait for lock to expire.
-        time.sleep(1.1)
-
-        try:
-            ds = ds_generator()
-            np.testing.assert_array_equal(arr, ds.x[0].numpy())
-            assert ds.read_only == False
-        finally:
-            deeplake.constants.DATASET_LOCK_VALIDITY = DATASET_LOCK_VALIDITY
+        with VM():
+            # Make sure read only warning is raised
+            with pytest.warns(UserWarning):
+                ds = ds_generator()
+                np.testing.assert_array_equal(arr, ds.x[0].numpy())
+            assert ds.read_only == True
+            with pytest.raises(LockedException):
+                ds.read_only = False
+            # Raise error if user explicitly asks for write access
+            with pytest.raises(LockedException):
+                ds = ds_generator(read_only=False)
+            # No warnings if user requests read only mode
+            with warnings.catch_warnings(record=True) as ws:
+                ds = ds_generator(read_only=True)
+                np.testing.assert_array_equal(arr, ds.x[0].numpy())
+            assert not ws
+    finally:
+        deeplake.constants.LOCK_LOCAL_DATASETS = False
 
 
-@enabled_cloud_dataset_generators
+@enabled_persistent_non_gdrive_dataset_generators
 def test_vc_locking(ds_generator):
-    ds = ds_generator()
-    ds.create_tensor("x")
-    arr = np.random.random((32, 32))
-    ds.x.append(arr)
-    ds.commit()
-    ds.checkout("branch", create=True)
-    with VM():
-        with warnings.catch_warnings(record=True) as ws:
-            ds = ds_generator()
-        np.testing.assert_array_equal(arr, ds.x[0].numpy())
-        assert not ws, str(ws[0])
+    deeplake.constants.LOCK_LOCAL_DATASETS = True
+    try:
+        ds = ds_generator()
+        ds.create_tensor("x")
+        arr = np.random.random((32, 32))
+        ds.x.append(arr)
+        ds.commit()
+        ds.checkout("branch", create=True)
+        with VM():
+            with warnings.catch_warnings(record=True) as ws:
+                ds = ds_generator()
+            np.testing.assert_array_equal(arr, ds.x[0].numpy())
+            assert not ws, str(ws[0])
+    finally:
+        deeplake.constants.LOCK_LOCAL_DATASETS = False
 
 
 def test_lock_thread_leaking(s3_ds_generator):
@@ -122,3 +121,23 @@ def test_lock_thread_leaking(s3_ds_generator):
         views[i].__del__()
     del views
     assert nlocks() == 0  # 0 because dataset and all views deleted
+
+
+def test_concurrent_locking(memory_ds):
+    storage = memory_ds.base_storage
+
+    def f(i):
+        lock = deeplake.core.lock.Lock(storage, "lock.lock")
+        with lock:
+            byts = storage.get("meta.json")
+            if byts is None:
+                d = {"x": []}
+            else:
+                d = json.loads(byts.decode("utf-8"))
+            d["x"].append(i)
+            storage["meta.json"] = json.dumps(d).encode("utf-8")
+
+    n = 10
+    with ThreadPoolExecutor(max_workers=n) as executor:
+        executor.map(f, range(n))
+    assert set(json.loads(storage["meta.json"])["x"]) == set(range(n))

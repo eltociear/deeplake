@@ -3,7 +3,7 @@ from deeplake.core.linked_chunk_engine import LinkedChunkEngine
 from deeplake.core.storage.lru_cache import LRUCache
 from deeplake.util.downsample import apply_partial_downsample
 from deeplake.util.invalid_view_op import invalid_view_op
-from deeplake.core.version_control.commit_chunk_set import CommitChunkSet
+from deeplake.core.version_control.commit_chunk_map import CommitChunkMap
 from deeplake.core.version_control.commit_diff import CommitDiff
 from deeplake.core.chunk.base_chunk import InputSample
 import numpy as np
@@ -24,7 +24,7 @@ from deeplake.api.info import Info, load_info
 from deeplake.util.keys import (
     get_chunk_id_encoder_key,
     get_chunk_key,
-    get_tensor_commit_chunk_set_key,
+    get_tensor_commit_chunk_map_key,
     get_tensor_commit_diff_key,
     get_tensor_meta_key,
     get_tensor_tile_encoder_key,
@@ -52,7 +52,11 @@ from deeplake.constants import FIRST_COMMIT_ID, _NO_LINK_UPDATE, UNSPECIFIED
 from deeplake.util.version_control import auto_checkout
 from deeplake.util.video import normalize_index
 
-from deeplake.compression import get_compression_type, VIDEO_COMPRESSION
+from deeplake.compression import (
+    get_compression_type,
+    VIDEO_COMPRESSION,
+    BYTE_COMPRESSION,
+)
 from deeplake.util.notebook import is_jupyter, video_html, is_colab
 from deeplake.util.object_3d.point_cloud import parse_point_cloud_to_dict
 from deeplake.util.object_3d.mesh import (
@@ -104,9 +108,9 @@ def create_tensor(
     storage[meta_key] = meta  # type: ignore
 
     if commit_id != FIRST_COMMIT_ID:
-        cset_key = get_tensor_commit_chunk_set_key(key, commit_id)
-        cset = CommitChunkSet()
-        storage[cset_key] = cset  # type: ignore
+        cmap_key = get_tensor_commit_chunk_map_key(key, commit_id)
+        cmap = CommitChunkMap()
+        storage[cmap_key] = cmap  # type: ignore
 
     diff_key = get_tensor_commit_diff_key(key, commit_id)
     diff = CommitDiff(created=True)
@@ -274,7 +278,6 @@ class Tensor:
         samples: Union[np.ndarray, Sequence[InputSample], "Tensor"],
         progressbar: bool = False,
     ):
-
         """Extends the end of the tensor by appending multiple elements from a sequence. Accepts a sequence, a single batched numpy array,
         or a sequence of :func:`deeplake.read` outputs, which can be used to load files. See examples down below.
 
@@ -311,6 +314,24 @@ class Tensor:
         self._write_initialization()
         [f() for f in list(self.dataset._update_hooks.values())]
         self.chunk_engine.extend(
+            samples,
+            progressbar=progressbar,
+            link_callback=self._extend_links if self.meta.links else None,
+        )
+        dataset_written(self.dataset)
+        self.invalidate_libdeeplake_dataset()
+
+    @invalid_view_op
+    def _extend_with_paths(
+        self,
+        samples: Union[np.ndarray, Sequence[InputSample], "Tensor"],
+        progressbar: bool = False,
+    ):
+        if not self.is_link:
+            raise ValueError("Not supported as the tensor is not a link.")
+        self._write_initialization()
+        [f() for f in list(self.dataset._update_hooks.values())]
+        self.chunk_engine.path_chunk_engine.extend(  # type: ignore
             samples,
             progressbar=progressbar,
             link_callback=self._extend_links if self.meta.links else None,
@@ -385,7 +406,6 @@ class Tensor:
     def clear(self):
         """Deletes all samples from the tensor"""
         self.chunk_engine.clear()
-        sample_id_key = get_sample_id_tensor_key(self.key)
         try:
             for t in self._all_tensor_links():
                 t.chunk_engine.clear()
@@ -456,8 +476,10 @@ class Tensor:
         shape = self.chunk_engine.shape(
             self.index, sample_shape_provider=sample_shape_provider
         )
-        if not shape and self.meta.max_shape:
-            shape = (0,) * len(self.meta.max_shape)
+
+        if len(self.index.values) == 1 and not self.index.values[0].subscriptable():
+            if np.sum(shape) == 0 and self.meta.max_shape:  # type: ignore
+                shape = (0,) * len(self.meta.max_shape)
         if self.meta.max_shape == [0, 0, 0]:
             shape = ()
         return shape
@@ -548,7 +570,7 @@ class Tensor:
         Note:
             If you are expecting a tuple, use :attr:`shape` instead.
         """
-        return self.chunk_engine.shape_interval
+        return self.chunk_engine.shape_interval(self.index)
 
     @property
     def is_dynamic(self) -> bool:
@@ -679,7 +701,6 @@ class Tensor:
                 update_link_callback=update_link_callback,
             )
         else:
-
             if not item_index.values[0].subscriptable() and not self.is_sequence:
                 # we're modifying a single sample, convert it to a list as chunk engine expects multiple samples
                 value = [value]
@@ -697,6 +718,23 @@ class Tensor:
             yield self.__getitem__(
                 i, is_iteration=not isinstance(self.index.values[0], list)
             )
+
+    @property
+    def is_empty_tensor(self):
+        if self.meta.is_link:
+            if len(self.meta.max_shape) == 0:
+                for chunk in self.chunk_engine.get_chunks_for_sample(0):
+                    if len(chunk.data_bytes) != 0:
+                        return False
+                return True
+            return False
+
+        if (
+            self.meta.chunk_compression
+            and get_compression_type(self.meta.chunk_compression) != BYTE_COMPRESSION
+        ):
+            return self.meta.max_shape == [0, 0, 0] or len(self.meta.max_shape) == 0
+        return len(self.meta.max_shape) == 0
 
     def numpy(
         self, aslist=False, fetch_chunks=False
@@ -1002,9 +1040,39 @@ class Tensor:
                     else:
                         val = cast_to_type(val, tensor.dtype)
                         tensor[global_sample_index] = val
-        # if self.meta.is_link and not has_shape_tensor:
-        #     func = get_link_transform("update_shape")
-        #     func(new_sample, link_creds=self.link_creds, tensor_meta=self.meta)
+
+    @invalid_view_op
+    def pop(self, index: Optional[int] = None):
+        """Removes an element at the given index."""
+
+        self.chunk_engine.pop(
+            index, link_callback=self._pop_links if self.meta.links else None
+        )
+
+        self.invalidate_libdeeplake_dataset()
+
+    def _pop_links(self, global_sample_index: int):
+        # meta.links contain tensor keys not names
+        rev_tensor_names = {v: k for k, v in self.dataset.meta.tensor_names.items()}
+
+        if self.meta.is_sequence:
+            flat_links: List[str] = []
+            links: List[str] = []
+            for link, props in self.meta.links.items():
+                (flat_links if props["flatten_sequence"] else links).append(link)
+
+            if flat_links:
+                seq_enc = self.chunk_engine.sequence_encoder
+                for link in flat_links:
+                    link_tensor = self.dataset[rev_tensor_names.get(link)]
+                    for idx in reversed(range(*seq_enc[global_sample_index])):
+                        link_tensor.pop(idx)
+        else:
+            links = list(self.meta.links.keys())
+        [
+            self.dataset[rev_tensor_names.get(link)].pop(global_sample_index)
+            for link in links
+        ]
 
     def _all_tensor_links(self):
         ds = self.dataset
@@ -1016,24 +1084,27 @@ class Tensor:
     @property
     def _sample_info_tensor(self):
         ds = self.dataset
+        tensor_name = self.meta.name or self.key
         return ds.version_state["full_tensors"].get(
             ds.version_state["tensor_names"].get(
-                get_sample_info_tensor_key(self.meta.name)
+                get_sample_info_tensor_key(tensor_name)
             )
         )
 
     @property
     def _sample_shape_tensor(self):
         ds = self.dataset
+        tensor_name = self.meta.name or self.key
         return ds.version_state["full_tensors"].get(
             ds.version_state["tensor_names"].get(
-                get_sample_shape_tensor_key(self.meta.name)
+                get_sample_shape_tensor_key(tensor_name)
             )
         )
 
     @property
     def _sample_id_tensor(self):
-        return self.dataset._tensors().get(get_sample_id_tensor_key(self.meta.name))
+        tensor_name = self.meta.name or self.key
+        return self.dataset._tensors().get(get_sample_id_tensor_key(tensor_name))
 
     def _sample_shape_provider(self, sample_shape_tensor) -> Callable:
         if self.is_sequence:
@@ -1107,7 +1178,7 @@ class Tensor:
 
     def _get_video_stream_url(self):
         if self.is_link:
-            return self.chunk_engine.get_video_url(self.index.values[0].value)
+            return self.chunk_engine.get_video_url(self.index.values[0].value)[0]
 
         from deeplake.visualizer.video_streaming import get_video_stream_url
 
@@ -1147,15 +1218,6 @@ class Tensor:
         else:
             webbrowser.open(self._get_video_stream_url())
 
-    @invalid_view_op
-    def pop(self, index: Optional[int] = None):
-        """Removes an element at the given index."""
-        if index is None:
-            index = self.num_samples - 1
-        self.chunk_engine.pop(index)
-        [self.dataset[link].pop(index) for link in self.meta.links]
-        self.invalidate_libdeeplake_dataset()
-
     @property
     def timestamps(self) -> np.ndarray:
         """Returns timestamps (in seconds) for video sample as numpy array.
@@ -1187,7 +1249,7 @@ class Tensor:
             sub_index = index.values[1].value if len(index.values) > 1 else None
         global_sample_index = next(index.values[0].indices(self.num_samples))
         if self.is_link:
-            sample = self.chunk_engine.get_video_url(global_sample_index)  # type: ignore
+            sample = self.chunk_engine.get_video_url(global_sample_index)[0]  # type: ignore
         else:
             sample = self.chunk_engine.get_video_sample(
                 global_sample_index, index, decompress=False
@@ -1251,6 +1313,15 @@ class Tensor:
             raise Exception(f"Only supported for linked tensors.")
         assert isinstance(self.chunk_engine, LinkedChunkEngine)
         return self.chunk_engine.path(self.index, fetch_chunks=fetch_chunks)
+
+    def creds_key(self):
+        """Return path data. Only applicable for linked tensors"""
+        if not self.is_link:
+            raise Exception(f"Only supported for linked tensors.")
+        if self.index.values[0].subscriptable() or len(self.index.values) > 1:
+            raise ValueError("_linked_sample can be used only on exatcly 1 sample.")
+        assert isinstance(self.chunk_engine, LinkedChunkEngine)
+        return self.chunk_engine.creds_key(self.index.values[0].value)
 
     def invalidate_libdeeplake_dataset(self):
         """Invalidates the libdeeplake dataset object."""

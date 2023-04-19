@@ -9,7 +9,6 @@ General Functions
     :toctree:
     :nosignatures:
 
-    list
     exists
 
 Making Deep Lake Samples
@@ -20,6 +19,7 @@ Making Deep Lake Samples
 
     read
     link
+    link_tiled
 
 Parallelism
 ~~~~~~~~~~~

@@ -8,7 +8,7 @@ from .common import (
 )
 
 
-def create_dataloader_nesteddataloader(
+def create_dataloader(
     dataset,
     tensors,
     use_local_cache,
@@ -49,45 +49,6 @@ def create_dataloader_nesteddataloader(
     )
 
 
-def create_dataloader_shufflingdataloader(
-    dataset,
-    tensors,
-    tobytes,
-    use_local_cache,
-    transform,
-    num_workers,
-    buffer_size,
-    batch_size,
-    collate_fn,
-    pin_memory,
-    drop_last,
-):
-    import torch
-    import torch.utils.data
-    from deeplake.integrations.pytorch.dataset import ShufflingIterableDataset
-
-    return torch.utils.data.DataLoader(
-        # this data set is more efficient also shuffles
-        # using threads race conditions as source of entropy
-        ShufflingIterableDataset(
-            dataset,
-            tensors=tensors,
-            tobytes=tobytes,
-            use_local_cache=use_local_cache,
-            transform=transform,
-            num_workers=num_workers,
-            buffer_size=buffer_size,
-        ),
-        batch_size=batch_size,
-        collate_fn=collate_fn,
-        pin_memory=pin_memory,
-        drop_last=drop_last,
-    )
-
-
-create_dataloader = create_dataloader_nesteddataloader
-
-
 def dataset_to_pytorch(
     dataset,
     num_workers: int,
@@ -106,7 +67,6 @@ def dataset_to_pytorch(
     decode_method: Optional[Dict[str, str]] = None,
     **kwargs,
 ):
-
     import torch
     from deeplake.integrations.pytorch.dataset import TorchDataset
 
@@ -166,6 +126,7 @@ def dataset_to_pytorch(
                 return_index=return_index,
                 pad_tensors=pad_tensors,
                 decode_method=decode_method,
+                batch_size=batch_size,
             ),
             batch_size=batch_size,
             collate_fn=collate_fn,

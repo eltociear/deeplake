@@ -9,7 +9,7 @@ from functools import partial
 
 import pathlib
 import numpy as np
-from time import time
+from time import time, sleep
 from tqdm import tqdm  # type: ignore
 
 import deeplake
@@ -17,7 +17,12 @@ from deeplake.core.index.index import IndexEntry
 from deeplake.core.link_creds import LinkCreds
 from deeplake.util.connect_dataset import connect_dataset_entry
 from deeplake.util.downsample import validate_downsampling
+from deeplake.util.version_control import (
+    save_version_info,
+    integrity_check,
+)
 from deeplake.util.invalid_view_op import invalid_view_op
+from deeplake.util.spinner import spinner
 from deeplake.util.iteration_warning import (
     suppress_iteration_warning,
     check_if_iteration,
@@ -42,6 +47,7 @@ from deeplake.core.storage import (
     S3Provider,
     GCSProvider,
     MemoryProvider,
+    LocalProvider,
 )
 from deeplake.core.tensor import Tensor, create_tensor, delete_tensor
 from deeplake.core.version_control.commit_node import CommitNode  # type: ignore
@@ -82,11 +88,13 @@ from deeplake.util.exceptions import (
     RenameError,
     EmptyCommitError,
     DatasetViewSavingError,
-    DatasetHandlerError,
     SampleAppendingError,
     DatasetTooLargeToDelete,
     TensorTooLargeToDelete,
     GroupInfoNotSupportedError,
+    TokenPermissionError,
+    CheckoutError,
+    DatasetCorruptError,
 )
 from deeplake.util.keys import (
     dataset_exists,
@@ -100,14 +108,6 @@ from deeplake.util.keys import (
     get_sample_shape_tensor_key,
     get_downsampled_tensor_key,
     filter_name,
-    get_tensor_meta_key,
-    get_tensor_commit_diff_key,
-    get_tensor_tile_encoder_key,
-    get_tensor_info_key,
-    get_tensor_commit_chunk_set_key,
-    get_chunk_id_encoder_key,
-    get_dataset_diff_key,
-    get_sequence_encoder_key,
     get_dataset_linked_creds_key,
 )
 from deeplake.util.path import get_path_from_storage
@@ -121,8 +121,9 @@ from deeplake.util.version_control import (
     load_meta,
     warn_node_checkout,
     load_version_info,
-    copy_metas,
-    create_commit_chunk_sets,
+    save_version_info,
+    replace_head,
+    reset_and_checkout,
 )
 from deeplake.util.pretty_print import summary_dataset
 from deeplake.core.dataset.view_entry import ViewEntry
@@ -133,7 +134,7 @@ import warnings
 import jwt
 
 
-_LOCKABLE_STORAGES = {S3Provider, GCSProvider}
+_LOCKABLE_STORAGES = {S3Provider, GCSProvider, LocalProvider}
 
 
 class Dataset:
@@ -149,6 +150,7 @@ class Dataset:
         verbose: bool = True,
         version_state: Optional[Dict[str, Any]] = None,
         path: Optional[Union[str, pathlib.Path]] = None,
+        address: Optional[str] = None,
         is_iteration: bool = False,
         link_creds=None,
         pad_tensors: bool = False,
@@ -172,6 +174,7 @@ class Dataset:
             verbose (bool): If ``True``, logs will be printed. Defaults to True.
             version_state (Dict[str, Any], Optional): The version state of the dataset, includes commit_id, commit_node, branch, branch_commit_map and commit_node_map.
             path (str, pathlib.Path): The path to the dataset.
+            address (Optional[str]): The version address of the dataset.
             is_iteration (bool): If this Dataset is being used as an iterator.
             link_creds (LinkCreds, Optional): The LinkCreds object used to access tensors that have external data linked to them.
             pad_tensors (bool): If ``True``, shorter tensors will be padded to the length of the longest tensor.
@@ -226,15 +229,12 @@ class Dataset:
         d["_pad_tensors"] = pad_tensors
         d["_locking_enabled"] = lock
         d["_temp_tensors"] = []
+        d["_vc_info_updated"] = True
         dct = self.__dict__
         dct.update(d)
-        dct["enabled_tensors"] = (
-            set(self._resolve_tensor_list(enabled_tensors, root=True))
-            if enabled_tensors
-            else None
-        )
+
         try:
-            self._set_derived_attributes()
+            self._set_derived_attributes(address=address)
         except LockedException:
             raise LockedException(
                 "This dataset cannot be open for writing as it is locked by another machine. Try loading the dataset with `read_only=True`."
@@ -243,6 +243,11 @@ class Dataset:
             raise ReadOnlyModeError(
                 "This dataset cannot be open for writing as you don't have permissions. Try loading the dataset with `read_only=True."
             )
+        dct["enabled_tensors"] = (
+            set(self._resolve_tensor_list(enabled_tensors, root=True))
+            if enabled_tensors
+            else None
+        )
         self._first_load_init()
         self._initial_autoflush: List[
             bool
@@ -269,9 +274,19 @@ class Dataset:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.storage.autoflush = self._initial_autoflush.pop()
+        autoflush = self._initial_autoflush.pop()
+        if not self._read_only and autoflush:
+            if self._vc_info_updated:
+                self._flush_vc_info()
+            spinner(self.storage.flush)()
+        self.storage.autoflush = autoflush
+
+    def maybe_flush(self):
         if not self._read_only:
-            self.storage.maybe_flush()
+            if self.storage.autoflush:
+                if self._vc_info_updated:
+                    self._flush_vc_info()
+                self.storage.flush()
 
     @property
     def num_samples(self) -> int:
@@ -303,8 +318,10 @@ class Dataset:
         """Returns the length of the smallest tensor."""
         tensor_lengths = [len(tensor) for tensor in self.tensors.values()]
         pad_tensors = self._pad_tensors
-        if not pad_tensors and min(tensor_lengths, default=0) != max(
-            tensor_lengths, default=0
+        if (
+            warn
+            and not pad_tensors
+            and min(tensor_lengths, default=0) != max(tensor_lengths, default=0)
         ):
             warning(
                 "The length of tensors in the dataset is different. The len(ds) returns the length of the "
@@ -376,16 +393,14 @@ class Dataset:
         state["_client"] = state["org_id"] = state["ds_name"] = None
         state["_temp_tensors"] = []
         state["libdeeplake_dataset"] = None
+        state["_vc_info_updated"] = False
+        state["_locked_out"] = False
         self.__dict__.update(state)
         self.__dict__["base_storage"] = get_base_storage(self.storage)
         # clear cache while restoring
         self.storage.clear_cache_without_flush()
         self._set_derived_attributes(verbose=False)
         self._indexing_history = []
-
-        for temp_tensor in self._temp_tensors:
-            self.delete_tensor(temp_tensor, large_ok=True)
-        self._temp_tensors = []
 
     def _reload_version_state(self):
         version_state = self.version_state
@@ -501,6 +516,10 @@ class Dataset:
                     )
                     for x in item
                 ]
+                for x in enabled_tensors:
+                    enabled_tensors.extend(
+                        self[posixpath.relpath(x, self.group_index)].meta.links.keys()
+                    )
                 ret = self.__class__(
                     storage=self.storage,
                     index=self.index,
@@ -1195,21 +1214,42 @@ class Dataset:
                 i, is_iteration=not isinstance(self.index.values[0], list)
             )
 
-    def _load_version_info(self):
+    def _load_version_info(self, address=None):
         """Loads data from version_control_file otherwise assume it doesn't exist and load all empty"""
         if self.version_state:
             return
 
-        branch = "main"
-        version_state = {"branch": branch}
+        if address is None:
+            address = "main"
+
+        version_state = {}
         try:
             version_info = load_version_info(self.storage)
             version_state["branch_commit_map"] = version_info["branch_commit_map"]
             version_state["commit_node_map"] = version_info["commit_node_map"]
-            commit_id = version_state["branch_commit_map"][branch]
+
+            if address in version_state["branch_commit_map"]:
+                branch = address
+                commit_id = version_state["branch_commit_map"][branch]
+            elif address in version_state["commit_node_map"]:
+                commit_id = address
+            else:
+                raise CheckoutError(
+                    f"Address {address} not found. Ensure the commit id / branch name is correct."
+                )
+
             version_state["commit_id"] = commit_id
             version_state["commit_node"] = version_state["commit_node_map"][commit_id]
-        except Exception:
+            version_state["branch"] = version_state["commit_node"].branch
+        except Exception as e:
+            if isinstance(e, CheckoutError):
+                raise e from None
+            if address != "main":
+                raise CheckoutError(
+                    f"Address {address} not found. Ensure the commit id / branch name is correct."
+                )
+            branch = "main"
+            version_state["branch"] = branch
             version_state["branch_commit_map"] = {}
             version_state["commit_node_map"] = {}
             # used to identify that this is the first commit so its data will not be in similar directory structure to the rest
@@ -1240,7 +1280,7 @@ class Dataset:
         self.link_creds = link_creds
 
     def _lock(self, err=False, verbose=True):
-        if not self._locking_enabled:
+        if not self.is_head_node or not self._locking_enabled:
             return True
         storage = self.base_storage
         if storage.read_only and not self._locked_out:
@@ -1251,6 +1291,10 @@ class Dataset:
         if isinstance(storage, tuple(_LOCKABLE_STORAGES)) and (
             not self.read_only or self._locked_out
         ):
+            if not deeplake.constants.LOCK_LOCAL_DATASETS and isinstance(
+                storage, LocalProvider
+            ):
+                return True
             try:
                 # temporarily disable read only on base storage, to try to acquire lock, if exception, it will be again made readonly
                 storage.disable_readonly()
@@ -1295,6 +1339,7 @@ class Dataset:
         except Exception:  # python shutting down
             pass
 
+    @spinner
     @invalid_view_op
     def commit(self, message: Optional[str] = None, allow_empty=False) -> str:
         """Stores a snapshot of the current state of the dataset.
@@ -1319,9 +1364,10 @@ class Dataset:
                 "There are no changes, commit is not done. Try again with allow_empty=True."
             )
 
-        return self._commit(message)
+        return self._commit(message, None, False)
 
     @deeplake_reporter.record_call
+    @spinner
     @invalid_view_op
     @suppress_iteration_warning
     def merge(
@@ -1368,12 +1414,17 @@ class Dataset:
 
         self._initial_autoflush.append(self.storage.autoflush)
         self.storage.autoflush = False
-
         merge(self, target_id, conflict_resolution, delete_removed_tensors, force)
-
+        self.__dict__["_vc_info_updated"] = False
         self.storage.autoflush = self._initial_autoflush.pop()
+        self.storage.maybe_flush()
 
-    def _commit(self, message: Optional[str] = None, hash: Optional[str] = None) -> str:
+    def _commit(
+        self,
+        message: Optional[str] = None,
+        hash: Optional[str] = None,
+        flush_version_control_info: bool = True,
+    ) -> str:
         if self._is_filtered_view:
             raise Exception(
                 "Cannot perform version control operations on a filtered dataset view."
@@ -1385,7 +1436,9 @@ class Dataset:
         self.storage.autoflush = False
         try:
             self._unlock()
-            commit(self, message, hash)
+            commit(self, message, hash, flush_version_control_info)
+            if not flush_version_control_info:
+                self.__dict__["_vc_info_updated"] = True
             self._lock()
         finally:
             self.storage.autoflush = self._initial_autoflush.pop()
@@ -1394,21 +1447,28 @@ class Dataset:
         [f() for f in list(self._commit_hooks.values())]
         # do not store commit message
         deeplake_reporter.feature_report(feature_name="commit", parameters={})
-
+        self.maybe_flush()
         return self.commit_id  # type: ignore
 
     @invalid_view_op
-    def checkout(self, address: str, create: bool = False) -> Optional[str]:
+    def checkout(
+        self, address: str, create: bool = False, reset: bool = False
+    ) -> Optional[str]:
         """Checks out to a specific commit_id or branch. If ``create = True``, creates a new branch with name ``address``.
 
         Args:
             address (str): The commit_id or branch to checkout to.
             create (bool): If ``True``, creates a new branch with name as address.
+            reset (bool): If checkout fails due to a corrupted HEAD state of the branch, setting ``reset=True`` will
+                          reset HEAD changes and attempt the checkout again.
 
         Returns:
             Optional[str]: The commit_id of the dataset after checkout.
 
         Raises:
+            CheckoutError: If ``address`` could not be found.
+            ReadOnlyModeError: If branch creation or reset is attempted in read-only mode.
+            DatasetCorruptError: If checkout failed due to dataset corruption and ``reset`` is not ``True``.
             Exception: If the dataset is a filtered view.
 
         Examples:
@@ -1432,40 +1492,56 @@ class Dataset:
         Note:
             Checkout from a head node in any branch that contains uncommitted data will lead to an automatic commit before the checkout.
         """
-        return self._checkout(address, create)
+        try:
+            ret = self._checkout(address, create, None, False)
+            integrity_check(self)
+            return ret
+        except (ReadOnlyModeError, CheckoutError) as e:
+            raise e from None
+        except Exception as e:
+            if create:
+                raise e
+            if not reset:
+                if isinstance(e, DatasetCorruptError):
+                    raise DatasetCorruptError(
+                        message=e.message,
+                        action="Try using `reset=True` to reset HEAD changes and load the previous commit.",
+                        cause=e.__cause__,
+                    )
+                raise DatasetCorruptError(
+                    "Exception occured (see Traceback). The branch you are checking out to maybe corrupted."
+                    "Try using `reset=True` to reset HEAD changes and load the previous commit."
+                    "This will delete all uncommitted changes on the branch you are trying to load."
+                ) from e
+            if self.read_only:
+                raise ReadOnlyModeError("Cannot reset HEAD in read-only mode.")
+            return reset_and_checkout(self, address, e)
 
     def _checkout(
         self,
         address: str,
         create: bool = False,
         hash: Optional[str] = None,
-        verbose=True,
+        verbose: bool = True,
+        flush_version_control_info: bool = False,
     ) -> Optional[str]:
         if self._is_filtered_view:
             raise Exception(
                 "Cannot perform version control operations on a filtered dataset view."
             )
-        if self._locked_out:
-            self.storage.disable_readonly()
-            self._read_only = False
-            self.base_storage.disable_readonly()
+        read_only = self._read_only
+        if read_only and create:
+            raise ReadOnlyModeError()
         try_flushing(self)
         self._initial_autoflush.append(self.storage.autoflush)
         self.storage.autoflush = False
-        err = False
         try:
             self._unlock()
-            checkout(self, address, create, hash)
-        except Exception as e:
-            err = True
-            if self._locked_out:
-                self.storage.enable_readonly()
-                self._read_only = True
-                self.base_storage.enable_readonly()
-            raise e
+            checkout(self, address, create, hash, flush_version_control_info)
+            if not flush_version_control_info and create:
+                self.__dict__["_vc_info_updated"] = True
         finally:
-            if not (err and self._locked_out):
-                self._lock(verbose=verbose)
+            self._set_read_only(read_only, err=True)
             self.storage.autoflush = self._initial_autoflush.pop()
         self._info = None
         self._ds_diff = None
@@ -1479,7 +1555,8 @@ class Dataset:
         commit_node = self.version_state["commit_node"]
         if self.verbose:
             warn_node_checkout(commit_node, create)
-
+        if create:
+            self.maybe_flush()
         return self.commit_id
 
     @deeplake_reporter.record_call
@@ -1554,8 +1631,6 @@ class Dataset:
     def _populate_meta(self, verbose=True):
         """Populates the meta information for the dataset."""
         if dataset_exists(self.storage):
-            if verbose and self.verbose:
-                logger.info(f"{self.path} loaded successfully.")
             load_meta(self)
 
         elif not self.storage.empty():
@@ -1618,13 +1693,27 @@ class Dataset:
             self.version_state, self.storage
         )
 
+    def _acquire_lock(self, timeout: Optional[int] = None):
+        if timeout is not None:
+            start_time = time()
+        while True:
+            try:
+                self._set_read_only(False, True)
+                return
+            except LockedException:
+                if timeout is not None and time() - start_time > timeout:
+                    raise LockedException()
+                sleep(1)
+
     def _set_read_only(self, value: bool, err: bool):
         storage = self.storage
         self.__dict__["_read_only"] = value
+
         if value:
             storage.enable_readonly()
             if isinstance(storage, LRUCache) and storage.next_storage is not None:
                 storage.next_storage.enable_readonly()
+            self._unlock()
         else:
             try:
                 locked = self._lock(err=err)
@@ -1639,7 +1728,8 @@ class Dataset:
                     self.__dict__["_read_only"] = True
             except LockedException as e:
                 self.__dict__["_read_only"] = True
-                raise e
+                if err:
+                    raise e
 
     @read_only.setter
     @invalid_view_op
@@ -1956,11 +2046,13 @@ class Dataset:
             for tensor_key, tensor_value in self.version_state["full_tensors"].items()
         }
 
-    def _set_derived_attributes(self, verbose: bool = True):
+    def _set_derived_attributes(
+        self, verbose: bool = True, address: Optional[str] = None
+    ):
         """Sets derived attributes during init and unpickling."""
         if self.is_first_load:
             self.storage.autoflush = True
-            self._load_version_info()
+            self._load_version_info(address)
             self._load_link_creds()
             self._set_read_only(
                 self._read_only, err=self._read_only_error
@@ -2034,13 +2126,20 @@ class Dataset:
             self, tensors=tensors, tobytes=tobytes, fetch_chunks=fetch_chunks
         )
 
+    @spinner
     def flush(self):
         """Necessary operation after writes if caches are being used.
         Writes all the dirty data from the cache layers (if any) to the underlying storage.
         Here dirty data corresponds to data that has been changed/assigned and but hasn't yet been sent to the
         underlying storage.
         """
+        self._flush_vc_info()
         self.storage.flush()
+
+    def _flush_vc_info(self):
+        if self._vc_info_updated:
+            save_version_info(self.version_state, self.storage)
+            self.__dict__["_vc_info_updated"] = False
 
     def clear_cache(self):
         """
@@ -2115,6 +2214,7 @@ class Dataset:
 
     def summary(self):
         """Prints a summary of the dataset."""
+
         pretty_print = summary_dataset(self)
 
         print(self)
@@ -2458,6 +2558,7 @@ class Dataset:
             skip_ok=True,
             extend_only=True,
             disable_label_sync=True,
+            disable_rechunk=True,
         )
 
     # the below methods are used by cloudpickle dumps
@@ -2512,7 +2613,7 @@ class Dataset:
                 )
         [f() for f in list(self._update_hooks.values())]
         for i in range(n):
-            self.append({k: v[i] for k, v in samples.items()})
+            self.append({k: v[i] for k, v in samples.items()}, skip_ok=skip_ok)
 
     @invalid_view_op
     def append(
@@ -2543,28 +2644,29 @@ class Dataset:
             >>> ds.append({"data": [1, 2, 3, 4], "labels":[0, 1, 2, 3]})
 
         """
+        tensors = self.tensors
         if isinstance(sample, Dataset):
             sample = sample.tensors
         if not isinstance(sample, dict):
             raise SampleAppendingError()
 
-        skipped_tensors = [k for k in self.tensors if k not in sample]
+        skipped_tensors = [k for k in tensors if k not in sample]
         if skipped_tensors and not skip_ok and not append_empty:
             raise KeyError(
                 f"Required tensors not provided: {skipped_tensors}. Pass either `skip_ok=True` to skip tensors or `append_empty=True` to append empty samples to unspecified tensors."
             )
         for k in sample:
-            if k not in self._tensors():
+            if k not in tensors:
                 raise TensorDoesNotExistError(k)
-        tensors_to_check_length = self.tensors if append_empty else sample
-        if len(set(map(len, (self[k] for k in tensors_to_check_length)))) != 1:
+        tensors_to_check_length = tensors if append_empty else sample
+        if len(set(map(len, (tensors[k] for k in tensors_to_check_length)))) != 1:
             raise ValueError(
                 "When appending using Dataset.append, all tensors being updated are expected to have the same length."
             )
         [f() for f in list(self._update_hooks.values())]
         tensors_appended = []
         with self:
-            for k in self.tensors:
+            for k in tensors:
                 if k in sample:
                     v = sample[k]
                 else:
@@ -2573,7 +2675,7 @@ class Dataset:
                     else:
                         v = None
                 try:
-                    tensor = self[k]
+                    tensor = tensors[k]
                     enc = tensor.chunk_engine.chunk_id_encoder
                     num_chunks = enc.num_chunks
                     tensor.append(v)
@@ -2594,7 +2696,7 @@ class Dataset:
                             self[k].pop()
                         except Exception as e2:
                             raise Exception(
-                                "Error while attepting to rollback appends"
+                                "Error while attempting to rollback appends"
                             ) from e2
                     raise e
 
@@ -2644,7 +2746,7 @@ class Dataset:
                     # Ignore storage level lock since we have file level lock
                     storage.read_only = False
                 lock = Lock(storage, get_queries_lock_key())
-                lock.acquire(timeout=10, force=True)
+                lock.acquire(timeout=10)
                 self2.lock = lock
 
             def __exit__(self2, *_, **__):
@@ -2749,57 +2851,6 @@ class Dataset:
         self._append_to_queries_json(info)
         return vds
 
-    def _save_view_in_user_queries_dataset(
-        self,
-        id: Optional[str],
-        message: Optional[str],
-        copy: bool,
-        tensors: Optional[List[str]],
-        num_workers: int,
-        scheduler: str,
-    ):
-        """Saves this view under hub://username/queries
-        Only applicable for views of Deep Lake cloud datasets.
-        """
-        if len(self.index.values) > 1:
-            raise NotImplementedError("Storing sub-sample slices is not supported yet.")
-
-        username = jwt.decode(self.token, options={"verify_signature": False})["id"]
-
-        if username == "public":
-            raise DatasetViewSavingError(
-                "Unable to save view for read only dataset. Login to save the view to your user account."
-            )
-
-        info = self._get_view_info(id, message, copy)
-        base = self._view_base or self
-        org_id, ds_name = base.org_id, base.ds_name
-        hash = f"[{org_id}][{ds_name}]{info['id']}"
-        info["id"] = hash
-        queries_ds_path = f"hub://{username}/queries"
-
-        try:
-            queries_ds = deeplake.load(
-                queries_ds_path,
-                verbose=False,
-            )  # create if doesn't exist
-        except PathNotEmptyException:
-            deeplake.delete(queries_ds_path, force=True)
-            queries_ds = deeplake.empty(queries_ds_path, verbose=False)
-        except DatasetHandlerError:
-            queries_ds = deeplake.empty(queries_ds_path, verbose=False)
-
-        queries_ds._unlock()  # we don't need locking as no data will be added to this ds.
-
-        path = f"hub://{username}/queries/{hash}"
-
-        vds = deeplake.empty(path, overwrite=True, verbose=False)
-
-        self._write_vds(vds, info, copy, tensors, num_workers, scheduler)
-        queries_ds._append_to_queries_json(info)
-
-        return vds
-
     def _save_view_in_path(
         self,
         path: str,
@@ -2858,7 +2909,6 @@ class Dataset:
             message (Optional, str): Custom user message.
             path (Optional, str, pathlib.Path): - The VDS will be saved as a standalone dataset at the specified path.
                 - If not specified, the VDS is saved under ``.queries`` subdirectory of the source dataset's storage.
-                - If the user doesn't have write access to the source dataset and the source dataset is a Deep Lake cloud dataset, then the VDS is saved is saved under the user's Deep Lake account and can be accessed using ``deeplake.load(f"hub://{username}/queries/{query_hash}")``.
             id (Optional, str): Unique id for this view. Random id will be generated if not specified.
             optimize (bool):
                 - If ``True``, the dataset view will be optimized by copying and rechunking the required data. This is necessary to achieve fast streaming speeds when training models using the dataset view. The optimization process will take some time, depending on the size of the data.
@@ -2875,11 +2925,14 @@ class Dataset:
         Raises:
             ReadOnlyModeError: When attempting to save a view inplace and the user doesn't have write access.
             DatasetViewSavingError: If HEAD node has uncommitted changes.
+            TypeError: If ``id`` is not of type ``str``.
 
         Note:
             Specifying ``path`` makes the view external. External views cannot be accessed using the parent dataset's :func:`Dataset.get_view`,
             :func:`Dataset.load_view`, :func:`Dataset.delete_view` methods. They have to be loaded using :func:`deeplake.load`.
         """
+        if id is not None and not isinstance(id, str):
+            raise TypeError(f"id {id} is of type {type(id)}, expected `str`.")
         return self._save_view(
             path,
             id,
@@ -2910,9 +2963,7 @@ class Dataset:
 
         Args:
             path (Optional, str, pathlib.Path): If specified, the VDS will saved as a standalone dataset at the specified path. If not,
-                the VDS is saved under `.queries` subdirectory of the source dataset's storage. If the user doesn't have
-                write access to the source dataset and the source dataset is a Deep Lake cloud dataset, then the VDS is saved
-                is saved under the user's Deep Lake account and can be accessed using deeplake.load(f"hub://{username}/queries/{query_hash}").
+                the VDS is saved under `.queries` subdirectory of the source dataset's storage.
             id (Optional, str): Unique id for this view.
             message (Optional, message): Custom user message.
             optimize (bool): Whether the view should be optimized by copying the required data. Default False.
@@ -2934,7 +2985,6 @@ class Dataset:
         """
 
         path = convert_pathlib_to_string_if_needed(path)
-
         ds_args["verbose"] = False
         vds = None
         if path is None and hasattr(self, "_vds"):
@@ -2945,17 +2995,32 @@ class Dataset:
                 warnings.warn(
                     f"This view is already saved with id '{vds_id}'. A copy of this view will be created with the provided id '{id}'"
                 )
+        base = self._view_base or self
+        if not base._read_only:
+            base.flush()
         if vds is None:
             if path is None:
                 if isinstance(self, MemoryProvider):
                     raise NotImplementedError(
                         "Saving views inplace is not supported for in-memory datasets."
                     )
-                if self.read_only and not (self._view_base or self)._locked_out:
+                if self.read_only and not base._locked_out:
                     if isinstance(self, deeplake.core.dataset.DeepLakeCloudDataset):
-                        vds = self._save_view_in_user_queries_dataset(
-                            id, message, optimize, tensors, num_workers, scheduler
-                        )
+                        try:
+                            with self._temp_write_access():
+                                vds = self._save_view_in_subdir(
+                                    id,
+                                    message,
+                                    optimize,
+                                    tensors,
+                                    num_workers,
+                                    scheduler,
+                                )
+                        except ReadOnlyModeError as e:
+                            raise ReadOnlyModeError(
+                                "Cannot save a view in this dataset because you are not a member of its organization."
+                                "Please specify a `path` in order to save the view at a custom location."
+                            ) from e
                     else:
                         raise ReadOnlyModeError(
                             "Cannot save view in read only dataset. Speicify a path to save the view in a different location."
@@ -3003,11 +3068,16 @@ class Dataset:
             self._parent_dataset[Index()]
             if (inherit_creds and self._parent_dataset)
             else deeplake.load(
-                self.info["source-dataset"], verbose=False, creds=creds, read_only=True
+                self.info["source-dataset"],
+                verbose=False,
+                creds=creds,
+                read_only=True,
+                token=self._token,
             )
         )
 
         ds.index = Index()
+        ds.version_state = ds.version_state.copy()
         ds._checkout(commit_id, verbose=False)
         first_index_subscriptable = self.info.get("first-index-subscriptable", True)
         if first_index_subscriptable:
@@ -3043,62 +3113,22 @@ class Dataset:
             view._query = query
         return view._save_view(vds_path, _ret_ds=True, **vds_args)
 
-    @staticmethod
-    def _get_queries_ds_from_user_account():
-        username = get_user_name()
-        if username == "public":
-            return
-        try:
-            return deeplake.load(f"hub://{username}/queries", verbose=False)
-        except DatasetHandlerError:
-            return
-
-    def _read_queries_json_from_user_account(self):
-        queries_ds = Dataset._get_queries_ds_from_user_account()
-        if not queries_ds:
-            return [], None
-        return (
-            list(
-                filter(
-                    lambda x: x["source-dataset"] == self.path,
-                    queries_ds._read_queries_json(),
-                )
-            ),
-            queries_ds,
-        )
-
     def get_views(self, commit_id: Optional[str] = None) -> List[ViewEntry]:
         """Returns list of views stored in this Dataset.
 
         Args:
             commit_id (str, optional): - Commit from which views should be returned.
-                - If not specified, views from current commit is returned.
-                - If not specified, views from the currently checked out commit will be returned.
+                - If not specified, views from all commits are returned.
 
         Returns:
             List[ViewEntry]: List of :class:`ViewEntry` instances.
         """
-        commit_id = commit_id or self.commit_id
         queries = self._read_queries_json()
-        f = lambda x: x["source-dataset-version"] == commit_id
-        ret = map(
-            partial(ViewEntry, dataset=self),
-            filter(f, queries),
-        )
-
-        if self.path.startswith("hub://"):
-            queries, qds = self._read_queries_json_from_user_account()
-            if queries:
-                ret = chain(
-                    ret,
-                    map(
-                        partial(
-                            ViewEntry, dataset=qds, source_dataset=self, external=True
-                        ),
-                        filter(f, queries),
-                    ),
-                )
-        return list(ret)
+        if commit_id is not None:
+            queries = filter(
+                lambda x: x["source-dataset-version"] == commit_id, queries
+            )
+        return list(map(partial(ViewEntry, dataset=self), queries))
 
     def get_view(self, id: str) -> ViewEntry:
         """Returns the dataset view corresponding to ``id``.
@@ -3126,11 +3156,6 @@ class Dataset:
         for q in queries:
             if q["id"] == id:
                 return ViewEntry(q, self)
-        if self.path.startswith("hub://"):
-            queries, qds = self._read_queries_json_from_user_account()
-            for q in queries:
-                if q["id"] == f"[{self.org_id}][{self.ds_name}]{id}":
-                    return ViewEntry(q, qds, self, True)
         raise KeyError(f"No view with id {id} found in the dataset.")
 
     def load_view(
@@ -3161,18 +3186,15 @@ class Dataset:
         Raises:
             KeyError: if view with given id does not exist.
         """
+        view = self.get_view(id)
         if optimize:
-            return (
-                self.get_view(id)
-                .optimize(
-                    tensors=tensors,
-                    num_workers=num_workers,
-                    scheduler=scheduler,
-                    progressbar=progressbar,
-                )
-                .load()
-            )
-        return self.get_view(id).load()
+            return view.optimize(
+                tensors=tensors,
+                num_workers=num_workers,
+                scheduler=scheduler,
+                progressbar=progressbar,
+            ).load()
+        return view.load()
 
     def delete_view(self, id: str):
         """Deletes the view with given view id.
@@ -3184,30 +3206,21 @@ class Dataset:
             KeyError: if view with given id does not exist.
         """
 
-        with self._lock_queries_json():
-            qjson = self._read_queries_json()
-            for i, q in enumerate(qjson):
-                if q["id"] == id:
-                    qjson.pop(i)
-                    self.base_storage.subdir(
-                        ".queries/" + (q.get("path") or q["id"])
-                    ).clear()
-                    self._write_queries_json(qjson)
-                    return
+        try:
+            with self._lock_queries_json():
+                qjson = self._read_queries_json()
+                for i, q in enumerate(qjson):
+                    if q["id"] == id:
+                        qjson.pop(i)
+                        self.base_storage.subdir(
+                            ".queries/" + (q.get("path") or q["id"])
+                        ).clear()
+                        self._write_queries_json(qjson)
+                        return
+        # not enough permissions to acquire lock
+        except TokenPermissionError:
+            pass
 
-        if self.path.startswith("hub://"):
-            qds = Dataset._get_queries_ds_from_user_account()
-            if qds:
-                with qds._lock_queries_json():
-                    qjson = qds._read_queries_json()
-                    for i, q in enumerate(qjson):
-                        if q["id"] == f"[{self.org_id}][{self.ds_name}]{id}":
-                            qjson.pop(i)
-                            qds.base_storage.subdir(
-                                ".queries/" + (q.get("path") or q["id"])
-                            ).clear()
-                            qds._write_queries_json(qjson)
-                            return
         raise KeyError(f"No view with id {id} found in the dataset.")
 
     def _sub_ds(
@@ -3219,6 +3232,7 @@ class Dataset:
         read_only=None,
         lock=True,
         verbose=True,
+        token=None,
     ):
         """Loads a nested dataset. Internal.
 
@@ -3230,6 +3244,7 @@ class Dataset:
             read_only (bool): Loads the sub dataset in read only mode if ``True``. Default ``False``.
             lock (bool): Whether the dataset should be locked for writing. Only applicable for S3, Deep Lake and GCS datasets. No effect if ``read_only=True``.
             verbose (bool): If ``True``, logs will be printed. Defaults to ``True``.
+            token (Optional[str]): Token of source dataset.
 
         Returns:
             Sub dataset
@@ -3237,7 +3252,7 @@ class Dataset:
         Note:
             Virtual datasets are returned as such, they are not converted to views.
         """
-        sub_storage = self.base_storage.subdir(path)
+        sub_storage = self.base_storage.subdir(path, read_only=read_only)
 
         if empty:
             sub_storage.clear()
@@ -3256,7 +3271,7 @@ class Dataset:
                 local_cache_size * MB,
             ),
             path=path,
-            token=self._token,
+            token=token,
             read_only=read_only,
             lock=lock,
             verbose=verbose,
@@ -3518,7 +3533,8 @@ class Dataset:
         )
 
     @invalid_view_op
-    def reset(self):
+    @spinner
+    def reset(self, force: bool = False):
         """Resets the uncommitted changes present in the branch.
 
         Note:
@@ -3528,49 +3544,24 @@ class Dataset:
         if version_state["commit_node"].children:
             print("You are not at the head node of the branch, cannot reset.")
             return
-        if not self.has_head_changes:
+        if not self.has_head_changes and not force:
             print("There are no uncommitted changes on this branch.")
             return
-
-        # delete metas first
-        self._delete_metas()
 
         if self.commit_id is None:
             storage.clear()
             self._populate_meta()
+            load_meta(self)
         else:
-            prefix = "/".join(("versions", self.pending_commit_id))
-            storage.clear(prefix=prefix)
-            src_id, dest_id = self.commit_id, self.pending_commit_id
+            parent_commit_id = self.commit_id
+            reset_commit_id = self.pending_commit_id
 
-            # by doing this checkout, we get list of tensors in previous commit, which is what we require for copying metas and create_commit_chunk_set
-            self.checkout(src_id)
-            copy_metas(src_id, dest_id, storage, version_state)
-            create_commit_chunk_sets(dest_id, storage, version_state)
-            self.checkout(dest_id)
-        load_meta(self)
+            # checkout to get list of tensors in previous commit, needed for copying metas and create_commit_chunk_set
+            self.checkout(parent_commit_id)
 
-    def _delete_metas(self):
-        """Deletes all metas in the dataset."""
-        commit_id = self.pending_commit_id
-        meta_keys = [get_dataset_meta_key(commit_id)]
-        meta_keys.append(get_dataset_diff_key(commit_id))
-        meta_keys.append(get_dataset_info_key(commit_id))
+            new_commit_id = replace_head(storage, version_state, reset_commit_id)
 
-        for tensor in self.tensors:
-            meta_keys.append(get_tensor_meta_key(commit_id, tensor))
-            meta_keys.append(get_tensor_tile_encoder_key(commit_id, tensor))
-            meta_keys.append(get_tensor_info_key(commit_id, tensor))
-            meta_keys.append(get_tensor_commit_chunk_set_key(commit_id, tensor))
-            meta_keys.append(get_tensor_commit_diff_key(commit_id, tensor))
-            meta_keys.append(get_chunk_id_encoder_key(commit_id, tensor))
-            meta_keys.append(get_sequence_encoder_key(commit_id, tensor))
-
-        for key in meta_keys:
-            try:
-                del self.storage[key]
-            except KeyError:
-                pass
+            self.checkout(new_commit_id)
 
     def connect(
         self,
@@ -3601,9 +3592,6 @@ class Dataset:
             InvalidSourcePathError: If the dataset's path is not a valid s3 or gcs path.
             InvalidDestinationPathError: If ``dest_path``, or ``org_id`` and ``ds_name`` do not form a valid Deep Lake path.
         """
-        self.__class__ = (
-            deeplake.core.dataset.deeplake_cloud_dataset.DeepLakeCloudDataset
-        )
         path = connect_dataset_entry(
             src_path=self.path,
             dest_path=dest_path,
@@ -3611,6 +3599,9 @@ class Dataset:
             ds_name=ds_name,
             creds_key=creds_key,
             token=token,
+        )
+        self.__class__ = (
+            deeplake.core.dataset.deeplake_cloud_dataset.DeepLakeCloudDataset
         )
         self._token = token
         self.path = path
@@ -3647,7 +3638,12 @@ class Dataset:
         self.link_creds.add_creds_key(creds_key)
         save_link_creds(self.link_creds, self.storage)
 
-    def populate_creds(self, creds_key: str, creds: dict):
+    def populate_creds(
+        self,
+        creds_key: str,
+        creds: Optional[dict] = None,
+        from_environment: bool = False,
+    ):
         """Populates the creds key added in add_creds_key with the given creds. These creds are used to fetch the external data.
         This needs to be done everytime the dataset is reloaded for datasets that contain links to external data.
 
@@ -3659,24 +3655,34 @@ class Dataset:
             >>> ds.add_creds_key("my_s3_key")
             >>> # populate the creds
             >>> ds.populate_creds("my_s3_key", {"aws_access_key_id": "my_access_key", "aws_secret_access_key": "my_secret_key"})
+            >>> # or
+            >>> ds.populate_creds("my_s3_key", from_environment=True)
 
         """
+        if creds and from_environment:
+            raise ValueError(
+                "Only one of creds or from_environment can be provided. Both cannot be provided at the same time."
+            )
+        if from_environment:
+            creds = {}
         self.link_creds.populate_creds(creds_key, creds)
 
-    def update_creds_key(self, old_creds_key: str, new_creds_key: str):
-        """Replaces the old creds key with the new creds key. This is used to replace the creds key used for external data."""
-        replaced_index = self.link_creds.replace_creds(old_creds_key, new_creds_key)
-        save_link_creds(self.link_creds, self.storage, replaced_index=replaced_index)
-
-    def change_creds_management(self, creds_key: str, managed: bool):
-        """Changes the management status of the creds key.
+    def update_creds_key(
+        self,
+        creds_key: str,
+        new_creds_key: Optional[str] = None,
+        managed: Optional[bool] = None,
+    ):
+        """Updates the name and/or management status of a creds key.
 
         Args:
-            creds_key (str): The key whose management status is to be changed.
+            creds_key (str): The key whose name and/or management status is to be changed.
+            new_creds_key (str, optional): The new key to replace the old key. If not provided, the old key will be used.
             managed (bool): The target management status. If ``True``, the creds corresponding to the key will be fetched from activeloop platform.
 
         Raises:
             ValueError: If the dataset is not connected to activeloop platform.
+            ValueError: If both ``new_creds_key`` and ``managed`` are ``None``.
             KeyError: If the creds key is not present in the dataset.
 
         Examples:
@@ -3688,19 +3694,32 @@ class Dataset:
             >>> # Populate the name added with creds dictionary
             >>> # These creds are only present temporarily and will have to be repopulated on every reload
             >>> ds.populate_creds("my_s3_key", {})
-            >>> # Change the management status of the key to True. Before doing this, ensure that the creds have been created on activeloop platform
+            >>> # Rename the key and change the management status of the key to True. Before doing this, ensure that the creds have been created on activeloop platform
             >>> # Now, this key will no longer use the credentials populated in the previous step but will instead fetch them from activeloop platform
             >>> # These creds don't have to be populated again on every reload and will be fetched every time the dataset is loaded
-            >>> ds.change_creds_management("my_s3_key", True)
+            >>> ds.update_creds_key("my_s3_key", "my_managed_key", True)
 
         """
-        raise ValueError(
-            "Managed creds are not supported for datasets that are not connected to activeloop platform."
-        )
+        if new_creds_key is None and managed is None:
+            raise ValueError(
+                "Atleast one of new_creds_key or managed must be provided."
+            )
+        if managed:
+            raise ValueError(
+                "Managed creds are not supported for datasets that are not connected to activeloop platform."
+            )
+        replaced_index = self.link_creds.replace_creds(creds_key, new_creds_key)
+        save_link_creds(self.link_creds, self.storage, replaced_index=replaced_index)
 
     def get_creds_keys(self) -> List[str]:
         """Returns the list of creds keys added to the dataset. These are used to fetch external data in linked tensors"""
-        return self.link_creds.creds_keys
+        return list(self.link_creds.creds_keys)
+
+    def get_managed_creds_keys(self) -> List[str]:
+        """Returns the list of creds keys added to the dataset that are managed by Activeloop platform. These are used to fetch external data in linked tensors."""
+        raise ValueError(
+            "Managed creds are not supported for datasets that are not connected to activeloop platform."
+        )
 
     def visualize(
         self, width: Union[int, str, None] = None, height: Union[int, str, None] = None
@@ -3756,52 +3775,57 @@ class Dataset:
         scheduler="threaded",
         progressbar=True,
     ):
-        with self._temp_write_access():
-            with self._lock_queries_json():
-                qjson = self._read_queries_json()
-                idx = -1
-                for i in range(len(qjson)):
-                    if qjson[i]["id"] == id:
-                        idx = i
-                        break
-                if idx == -1:
-                    raise KeyError(f"View with id {id} not found.")
-                info = qjson[i]
-                if not info["virtual-datasource"]:
-                    # Already optimized
-                    return info
-                path = info.get("path", info["id"])
-                vds = self._sub_ds(".queries/" + path, verbose=False)
-                view = vds._get_view(not external)
-                new_path = path + "_OPTIMIZED"
-                optimized = self._sub_ds(
-                    ".queries/" + new_path, empty=True, verbose=False
-                )
-                view._copy(
-                    optimized,
-                    tensors=tensors,
-                    overwrite=True,
-                    unlink=unlink,
-                    create_vds_index_tensor=True,
-                    num_workers=num_workers,
-                    scheduler=scheduler,
-                    progressbar=progressbar,
-                )
-                optimized.info.update(vds.info.__getstate__())
-                optimized.info["virtual-datasource"] = False
-                optimized.info["path"] = new_path
-                optimized.flush()
-                info["virtual-datasource"] = False
-                info["path"] = new_path
-                self._write_queries_json(qjson)
-            vds.base_storage.disable_readonly()
-            try:
-                vds.base_storage.clear()
-            except Exception as e:
-                warnings.warn(
-                    f"Error while deleting old view after writing optimized version: {e}"
-                )
-            return info
+        try:
+            with self._temp_write_access():
+                with self._lock_queries_json():
+                    qjson = self._read_queries_json()
+                    idx = -1
+                    for i in range(len(qjson)):
+                        if qjson[i]["id"] == id:
+                            idx = i
+                            break
+                    if idx == -1:
+                        raise KeyError(f"View with id {id} not found.")
+                    info = qjson[i]
+                    if not info["virtual-datasource"]:
+                        # Already optimized
+                        return info
+                    path = info.get("path", info["id"])
+                    vds = self._sub_ds(".queries/" + path, verbose=False)
+                    view = vds._get_view(not external)
+                    new_path = path + "_OPTIMIZED"
+                    optimized = self._sub_ds(
+                        ".queries/" + new_path, empty=True, verbose=False
+                    )
+                    view._copy(
+                        optimized,
+                        tensors=tensors,
+                        overwrite=True,
+                        unlink=unlink,
+                        create_vds_index_tensor=True,
+                        num_workers=num_workers,
+                        scheduler=scheduler,
+                        progressbar=progressbar,
+                    )
+                    optimized.info.update(vds.info.__getstate__())
+                    optimized.info["virtual-datasource"] = False
+                    optimized.info["path"] = new_path
+                    optimized.flush()
+                    info["virtual-datasource"] = False
+                    info["path"] = new_path
+                    self._write_queries_json(qjson)
+                vds.base_storage.disable_readonly()
+                try:
+                    vds.base_storage.clear()
+                except Exception as e:
+                    warnings.warn(
+                        f"Error while deleting old view after writing optimized version: {e}"
+                    )
+                return info
+        except ReadOnlyModeError as e:
+            raise ReadOnlyModeError(
+                f"You do not have permission to materialize views in this dataset ({self.path})."
+            ) from e
 
     def _sample_indices(self, maxlen: int):
         vds_index = self._tensors(include_hidden=True).get("VDS_INDEX")
@@ -3862,6 +3886,10 @@ class Dataset:
             or hasattr(self, "_vds")
             or hasattr(self, "_view_entry")
         )
+
+    @property
+    def is_optimized(self) -> bool:
+        return not getattr(getattr(self, "_view_entry", None), "virtual", True)
 
     @property
     def min_view(self):

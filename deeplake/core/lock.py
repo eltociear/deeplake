@@ -4,7 +4,7 @@ import uuid
 import struct
 import atexit
 import threading
-
+from os import urandom, getpid
 from typing import Tuple, Dict, Callable, Optional, Set
 from collections import defaultdict
 from deeplake.util.exceptions import LockedException
@@ -12,65 +12,118 @@ from deeplake.util.keys import get_dataset_lock_key
 from deeplake.util.remove_cache import get_base_storage
 from deeplake.util.path import get_path_from_storage
 from deeplake.util.threading import terminate_thread
-from deeplake.core.storage import StorageProvider
+from deeplake.core.storage import StorageProvider, LocalProvider, MemoryProvider
 from deeplake.constants import FIRST_COMMIT_ID
 from deeplake.client.utils import get_user_name
 
 
-def _get_lock_bytes(username: Optional[str] = None) -> bytes:
-    byts = uuid.getnode().to_bytes(6, "little") + struct.pack("d", time.time())
-    ## TODO Uncomment lines below once this version has propogated through the userbase.
-    # if username:
-    #     byts += username.encode("utf-8")
+def _get_lock_bytes(tag: Optional[bytes] = None, duration: int = 10) -> bytes:
+    byts = uuid.getnode().to_bytes(6, "little") + struct.pack(
+        "d", time.time() + duration
+    )
+    if tag:
+        byts += tag
     return byts
 
 
-def _parse_lock_bytes(byts) -> Tuple[int, int, str]:
+def _parse_lock_bytes(byts) -> Tuple[int, int, bytes]:
+    assert len(byts) >= 14, len(byts)
     byts = memoryview(byts)
     nodeid = int.from_bytes(byts[:6], "little")
     timestamp = struct.unpack("d", byts[6:14])[0]
-    username = str(byts[14:], "utf-8")
-    return nodeid, timestamp, username
+    tag = byts[14:]
+    return nodeid, timestamp, tag
 
 
 class Lock(object):
-    def __init__(self, storage: StorageProvider, path: str):
+    def __init__(self, storage: StorageProvider, path: str, duration: int = 10):
         self.storage = storage
+        self._lock_verify_interval = (
+            0.01
+            if isinstance(storage, (LocalProvider, MemoryProvider))
+            else deeplake.constants.LOCK_VERIFY_INTERVAL
+        )
         self.path = path
         username = get_user_name()
         if username == "public":
             self.username = None
         else:
             self.username = username
+        self.tag = int.to_bytes(getpid(), 4, "little")
+        self.duration = duration
+        self._min_sleep = (
+            0.01 if isinstance(storage, (LocalProvider, MemoryProvider)) else 1
+        )
+        self.acquired = False
 
     def _write_lock(self):
         storage = self.storage
         try:
             read_only = storage.read_only
             storage.disable_readonly()
-            storage[self.path] = _get_lock_bytes(self.username)
+            storage[self.path] = _get_lock_bytes(self.tag, self.duration)
         finally:
             if read_only:
                 storage.enable_readonly()
 
-    def acquire(self, timeout=10, force=False):
+    def refresh_lock(self):
         storage = self.storage
         path = self.path
-        try:
-            nodeid, timestamp, _ = _parse_lock_bytes(storage[path])
-        except KeyError:
-            return self._write_lock()
-        if nodeid == uuid.getnode():
-            return self._write_lock()
-        while path in storage:
-            if time.time() - timestamp >= timeout:
-                if force:
-                    return self._write_lock()
-                else:
-                    raise LockedException()
-            time.sleep(1)
+        byts = storage.get(path)
+        if not byts:
+            raise LockedException()
+        nodeid, timestamp, tag = _parse_lock_bytes(byts)
+        if tag != self.tag or nodeid != uuid.getnode():
+            raise LockedException()
+        self._write_lock()
+
+    def acquire(self, timeout: Optional[int] = None):
+        storage = self.storage
+        path = self.path
+        if timeout is not None:
+            start_time = time.time()
+        while True:
+            try:
+                byts = storage.get(path)
+            except Exception:
+                byts = None
+            if byts:
+                nodeid, timestamp, tag = _parse_lock_bytes(byts)
+                locked = tag != self.tag or nodeid != uuid.getnode()
+                if not locked:  # Identical lock
+                    return
+            else:
+                locked = False
+
+            if locked:
+                rem = timestamp - time.time()
+                if rem > 0:
+                    if timeout is not None and time.time() - start_time > timeout:
+                        raise LockedException()
+                    time.sleep(min(rem, self._min_sleep))
+                    continue
+
+            self._write_lock()
+            time.sleep(self._lock_verify_interval)
+            try:
+                byts = storage.get(path)
+            except Exception:
+                byts = None
+            if not byts:
+                continue
+            nodeid, timestamp, tag = _parse_lock_bytes(byts)
+            if self.tag == tag and nodeid == uuid.getnode():
+                self.acquired = True
+                return
+            else:
+                rem = timestamp - time.time()
+                if rem > 0:
+                    time.sleep(min(rem, self._min_sleep))
+                continue
 
     def release(self):
+        if not self.acquired:
+            return
         storage = self.storage
         try:
             read_only = storage.read_only
@@ -123,68 +176,31 @@ class PersistentLock(Lock):
         self.acquired = False
         self._thread_lock = threading.Lock()
         self._previous_update_timestamp = None
-        username = get_user_name()
-        if username == "public":
-            self.username = None
-        else:
-            self.username = username
+        self.lock = Lock(storage, self.path, deeplake.constants.DATASET_LOCK_VALIDITY)
+        self.acquired = False
         self.acquire()
         atexit.register(self.release)
-
-    def _lock_loop(self):
-        try:
-            while True:
-                try:
-                    if (
-                        self._previous_update_timestamp is not None
-                        and time.time() - self._previous_update_timestamp
-                        >= deeplake.constants.DATASET_LOCK_VALIDITY
-                    ):
-                        # Its been too long since last update, another machine might have locked the storage
-                        lock_bytes = self.storage.get(self.path)
-                        if lock_bytes:
-                            nodeid, _, _ = _parse_lock_bytes(lock_bytes)
-                            if nodeid != uuid.getnode():
-                                if self.lock_lost_callback:
-                                    self.lock_lost_callback()
-                                self.acquired = False
-                                return
-                        elif not self._init:
-                            if self.lock_lost_callback:
-                                self.lock_lost_callback()
-                            self.acquired = False
-                            return
-                    self._previous_update_timestamp = time.time()
-                    self.storage[self.path] = _get_lock_bytes(self.username)
-                except Exception:
-                    pass
-                self._init = False
-                time.sleep(deeplake.constants.DATASET_LOCK_UPDATE_INTERVAL)
-        except Exception:  # Thread termination
-            return
 
     def acquire(self):
         if self.acquired:
             return
-        self.storage.check_readonly()
-        lock_bytes = self.storage.get(self.path)
-        if lock_bytes is not None:
-            nodeid = None
-            try:
-                nodeid, timestamp, _ = _parse_lock_bytes(lock_bytes)
-            except Exception:  # parse error from corrupt lock file, ignore
-                pass
-            if nodeid:
-                if nodeid == uuid.getnode():
-                    # Lock left by this machine from a previous run, ignore
-                    pass
-                elif time.time() - timestamp < deeplake.constants.DATASET_LOCK_VALIDITY:
-                    raise LockedException()
-
-        self._init = True
+        self.lock.acquire(timeout=0)
         self._thread = threading.Thread(target=self._lock_loop, daemon=True)
         self._thread.start()
         self.acquired = True
+
+    def _lock_loop(self):
+        try:
+            while True:
+                time.sleep(deeplake.constants.DATASET_LOCK_UPDATE_INTERVAL)
+                try:
+                    self.lock.refresh_lock(timeout=0)
+                except LockedException:
+                    if self.lock_lost_callback:
+                        self.lock_lost_callback()
+                    return
+        except Exception:  # Thread termination
+            return
 
     def release(self):
         if not self.acquired:
@@ -193,7 +209,7 @@ class PersistentLock(Lock):
             terminate_thread(self._thread)
             self._acquired = False
         try:
-            del self.storage[self.path]
+            self.lock.release()
         except Exception:
             pass
 

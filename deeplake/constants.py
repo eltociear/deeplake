@@ -1,4 +1,6 @@
 import os
+import sys
+
 import numpy as np
 
 
@@ -52,13 +54,14 @@ TENSOR_INFO_FILENAME = "tensor_info.json"
 
 DATASET_LOCK_FILENAME = "dataset_lock.lock"
 DATASET_DIFF_FILENAME = "dataset_diff"
-TENSOR_COMMIT_CHUNK_SET_FILENAME = "chunk_set"
+TENSOR_COMMIT_CHUNK_MAP_FILENAME = "chunk_set"
 TENSOR_COMMIT_DIFF_FILENAME = "commit_diff"
 TIMESTAMP_FILENAME = "local_download_timestamp"
 
 
 DATASET_LOCK_UPDATE_INTERVAL = 120  # seconds
 DATASET_LOCK_VALIDITY = 300  # seconds
+LOCK_VERIFY_INTERVAL = 0.5  # seconds
 
 META_ENCODING = "utf8"
 
@@ -67,6 +70,8 @@ ENCODED_TILE_NAMES_FOLDER = "tiles_index"
 ENCODED_CREDS_FOLDER = "creds_index"
 ENCODED_CHUNK_NAMES_FOLDER = "chunks_index"
 ENCODED_SEQUENCE_NAMES_FOLDER = "sequence_index"
+ENCODED_PAD_NAMES_FOLDER = "pad_index"
+
 # unsharded naming will help with backwards compatibility
 UNSHARDED_ENCODER_FILENAME = "unsharded"
 
@@ -161,3 +166,19 @@ WANDB_INTEGRATION_ENABLED = True
 WANDB_JSON_FILENMAE = "wandb.json"
 
 SHOW_ITERATION_WARNING = True
+RETURN_DUMMY_DATA_FOR_DATALOADER = False
+
+# Delay before spinner starts on time consuming functions (in seconds)
+SPINNER_START_DELAY = 2
+
+PYTEST_ENABLED = os.environ.get("DEEPLAKE_PYTEST_ENABLED", "").lower().strip() == "true"
+
+SPINNER_ENABLED = not PYTEST_ENABLED
+
+LOCK_LOCAL_DATASETS = not PYTEST_ENABLED
+
+# Rechunk after transform if average chunk size is less than
+# this fraction of min chunk size
+TRANSFORM_RECHUNK_AVG_SIZE_BOUND = 0.1
+
+TIME_INTERVAL_FOR_CUDA_MEMORY_CLEANING = 10 * 60

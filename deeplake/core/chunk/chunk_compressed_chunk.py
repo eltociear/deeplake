@@ -14,8 +14,8 @@ from deeplake.core.tiling.sample_tiles import SampleTiles
 from deeplake.core.polygon import Polygons
 from deeplake.util.casting import intelligent_cast
 from deeplake.util.compression import get_compression_ratio
-from deeplake.util.exceptions import EmptyTensorError, TensorDtypeMismatchError
-from .base_chunk import BaseChunk, InputSample
+from deeplake.util.exceptions import TensorDtypeMismatchError
+from .base_chunk import BaseChunk, InputSample, catch_chunk_read_error
 from deeplake.core.serialize import infer_chunk_num_bytes
 from deeplake.constants import ENCODING_DTYPE
 import deeplake
@@ -81,7 +81,6 @@ class ChunkCompressedChunk(BaseChunk):
             else:
                 num_samples = len(incoming_samples)
             if not num_samples:
-
                 # Check if compression ratio is actually better
                 s = self._text_sample_to_byte_string(incoming_samples[0])
                 new_decompressed = decompressed_bytes + s
@@ -183,7 +182,6 @@ class ChunkCompressedChunk(BaseChunk):
             else:
                 num_samples = len(incoming_samples)
             if not num_samples:
-
                 # Check if compression ratio is actually better
                 samples_to_chunk = incoming_samples[:1]
                 if cast:
@@ -259,7 +257,6 @@ class ChunkCompressedChunk(BaseChunk):
             if (
                 len(self.decompressed_bytes) + sample_nbytes  # type: ignore
             ) * self._compression_ratio > self.min_chunk_size:
-
                 decompressed_bytes = self.decompressed_bytes
                 new_decompressed = self.decompressed_bytes + serialized_sample  # type: ignore
 
@@ -362,6 +359,7 @@ class ChunkCompressedChunk(BaseChunk):
             as_bytes=as_bytes
         )
 
+    @catch_chunk_read_error
     def read_sample(
         self,
         local_index: int,

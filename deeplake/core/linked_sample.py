@@ -1,16 +1,9 @@
 from typing import Optional
-from deeplake.constants import ALL_CLOUD_PREFIXES
+from deeplake.util.exceptions import GetDataFromLinkError
+from deeplake.util.exceptions import MissingCredsError
 from deeplake.util.path import get_path_type
 import deeplake
 import numpy as np
-
-
-def convert_creds_key(creds_key: Optional[str], path: str):
-    if creds_key is None and path.startswith(ALL_CLOUD_PREFIXES):
-        creds_key = "ENV"
-    elif creds_key == "ENV" and not path.startswith(ALL_CLOUD_PREFIXES):
-        creds_key = None
-    return creds_key
 
 
 class LinkedSample:
@@ -18,7 +11,7 @@ class LinkedSample:
 
     def __init__(self, path: str, creds_key: Optional[str] = None):
         self.path = path
-        self.creds_key = convert_creds_key(creds_key, path)
+        self.creds_key = creds_key
 
     @property
     def dtype(self) -> str:
@@ -26,28 +19,35 @@ class LinkedSample:
 
 
 def read_linked_sample(
-    sample_path: str, sample_creds_key: str, link_creds, verify: bool
+    sample_path: str, sample_creds_key: Optional[str], link_creds, verify: bool
 ):
     provider_type = get_path_type(sample_path)
-    if provider_type == "local":
-        return deeplake.read(sample_path, verify=verify)
-    elif provider_type == "http":
-        return _read_http_linked_sample(
-            link_creds, sample_creds_key, sample_path, verify
-        )
-    else:
-        return _read_cloud_linked_sample(
-            link_creds, sample_creds_key, sample_path, provider_type, verify
-        )
+    try:
+        if provider_type == "local":
+            return deeplake.read(sample_path, verify=verify)
+        elif provider_type == "http":
+            return _read_http_linked_sample(
+                link_creds, sample_creds_key, sample_path, verify
+            )
+        else:
+            return _read_cloud_linked_sample(
+                link_creds, sample_creds_key, sample_path, provider_type, verify
+            )
+    except Exception as e:
+        raise GetDataFromLinkError(sample_path) from e
 
 
 def retry_refresh_managed_creds(f):
     def wrapper(linked_creds, sample_creds_key, *args, **kwargs):
         try:
             return f(linked_creds, sample_creds_key, *args, **kwargs)
+        except MissingCredsError:
+            raise
         except Exception as e:
-            linked_creds.populate_all_managed_creds()
-            return f(linked_creds, sample_creds_key, *args, **kwargs)
+            if linked_creds.client is not None:
+                linked_creds.populate_all_managed_creds()
+                return f(linked_creds, sample_creds_key, *args, **kwargs)
+            raise e
 
     return wrapper
 

@@ -63,11 +63,11 @@ class TensorMeta(Meta):
         """
 
         super().__init__()
-        if htype and htype not in [UNSPECIFIED, HTYPE.DEFAULT]:
-            self.set_htype(htype, **kwargs)
-        else:
+        if htype in (None, UNSPECIFIED):
             self.set_htype(HTYPE.DEFAULT, **kwargs)
             self.htype = None  # type: ignore
+        else:
+            self.set_htype(htype, **kwargs)
 
     def add_link(
         self, name, extend_f: str, update_f: Optional[str], flatten_sequence: bool
@@ -293,10 +293,7 @@ def _replace_unspecified_values(htype: str, htype_overwrite: dict):
         if isinstance(v, str) and v == UNSPECIFIED:
             htype_overwrite[k] = defaults[k]
 
-    if (
-        htype in ("json", "list", "text", "point_cloud_calibration_matrix")
-        and not htype_overwrite["dtype"]
-    ):
+    if htype in ("json", "list", "text", "intrinsics") and not htype_overwrite["dtype"]:
         htype_overwrite["dtype"] = HTYPE_CONFIGURATIONS[htype]["dtype"]
 
 
@@ -342,7 +339,7 @@ def _format_values(htype: str, htype_overwrite: dict):
 
     dtype = htype_overwrite["dtype"]
     if dtype is not None:
-        if htype in ("json", "list", "point_cloud_calibration_matrix"):
+        if htype in ("json", "list", "intrinsics"):
             if getattr(dtype, "__module__", None) == "typing":
                 htype_overwrite["dtype"] = str(dtype)
         else:
